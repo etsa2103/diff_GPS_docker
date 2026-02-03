@@ -1,0 +1,93 @@
+FROM nvidia/cuda:12.6.1-runtime-ubuntu24.04
+
+# configure locales for ROS install
+RUN apt-get update \
+  && export TZ="America/New_York" \
+  && DEBIAN_FRONTEND=noninteractive apt-get install -y keyboard-configuration \
+  && DEBIAN_FRONTEND=noninteractive apt-get install -y tzdata \
+  && DEBIAN_FRONTEND=noninteractive apt-get install -y locales \
+  && ln -fs "/usr/share/zoneinfo/$TZ" /etc/localtime \
+  && dpkg-reconfigure --frontend noninteractive tzdata \
+  && apt-get clean
+
+# install the basics
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+ vim tmux cmake gcc g++ git build-essential \
+ sudo wget curl zip unzip
+
+# Install ROS Jazzy
+RUN sudo apt install -y software-properties-common \
+  && sudo add-apt-repository universe
+RUN export ROS_APT_SOURCE_VERSION=$(curl -s https://api.github.com/repos/ros-infrastructure/ros-apt-source/releases/latest | grep -F "tag_name" | awk -F'"' '{print $4}')\
+  && curl -L -o /tmp/ros2-apt-source.deb "https://github.com/ros-infrastructure/ros-apt-source/releases/download/${ROS_APT_SOURCE_VERSION}/ros2-apt-source_${ROS_APT_SOURCE_VERSION}.$(. /etc/os-release && echo $VERSION_CODENAME)_all.deb" \
+  && sudo apt install /tmp/ros2-apt-source.deb \
+  && sudo apt update \
+  && sudo apt install -y ros-dev-tools
+RUN sudo apt update \
+  && sudo apt install -y ros-jazzy-desktop
+  
+# add a user
+RUN userdel ubuntu
+ARG user_id
+ENV USER=dtc
+RUN useradd -U --uid ${user_id} -ms /bin/bash $USER \
+ && echo "$USER:$USER" | chpasswd \
+ && adduser $USER sudo \
+ && echo "$USER ALL=NOPASSWD: ALL" >> /etc/sudoers.d/$USER
+
+# bagging
+RUN apt install -y ros-jazzy-rosbag2-storage-mcap
+
+# configure ros network
+RUN apt install -y ros-jazzy-rmw-zenoh-cpp
+ENV RMW_IMPLEMENTATION=rmw_zenoh_cpp
+ENV ROS_LOCALHOST_ONLY=1
+ENV ZENOH_CONFIG_OVERRIDE='transport/shared_memory/enabled=true'
+
+# python utilities
+RUN apt update \
+ && apt install -y python3-pip python3-venv python3-pytest
+
+# Install common ROS 2 message packages
+RUN sudo apt-get update && sudo apt-get install -y \
+    ros-jazzy-sensor-msgs \
+    ros-jazzy-geometry-msgs \
+    ros-jazzy-std-msgs \
+    python3-opencv \
+    libusb-1.0-0-dev libgtk2.0-0 libqt5widgets5 \
+ && rm -rf /var/lib/apt/lists/*
+
+# ------------------ Workspace setup ------------------
+USER $USER
+WORKDIR /home/$USER
+RUN mkdir -p ws/src
+WORKDIR /home/$USER/ws/src
+
+# Copy packages
+COPY --chown=$USER:$USER ./src/diff_GPS ./diff_GPS
+
+# Copy custom entrypoint
+COPY --chown=$USER:$USER ./entrypoint.bash /home/$USER/entrypoint.bash
+RUN chmod +x /home/$USER/entrypoint.bash
+
+WORKDIR /home/$USER/ws
+
+# ------------------ rosdep ------------------
+RUN sudo rosdep init 2>/dev/null || echo "rosdep already initialized" \
+ && rosdep update
+RUN rosdep install --from-paths src --ignore-src -r -y
+
+# ------------------ Build packages ------------------
+ARG ROS_DISTRO=jazzy
+ENV ROS_DISTRO=${ROS_DISTRO}
+
+# Build Python nodes
+RUN /bin/bash -c "source /opt/ros/$ROS_DISTRO/setup.bash && colcon build --symlink-install --packages-select diff_GPS"
+
+# ------------------ Finalize environment ------------------
+RUN echo "source /opt/ros/$ROS_DISTRO/setup.bash" >> ~/.bashrc \
+ && echo "source ~/ws/install/setup.bash" >> ~/.bashrc \
+ && echo 'export PS1="\[$(tput setaf 2; tput bold)\]\u\[$(tput setaf 7)\]@\[$(tput setaf 3)\]\h\[$(tput setaf 7)\]:\[$(tput setaf 4)\]\W\[$(tput setaf 7)\]$ \[$(tput sgr0)\]"' >> ~/.bashrc
+
+ENTRYPOINT ["/home/dtc/entrypoint.bash"]
