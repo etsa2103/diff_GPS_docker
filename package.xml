@@ -2,7 +2,7 @@
 <?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
 <package format="3">
   <name>diff_gps</name>
-  <version>0.0.0</version>
+  <version>0.0.2</version>
   <description>Package for running differential gps on jackals</description>
   <maintainer email="etsa@seas.upenn.edu">etsa2103</maintainer>
   <license>Apache-2.0</license>
@@ -13,7 +13,7 @@
   <depend>sensor_msgs</depend>
   <depend>geometry_msgs</depend>
   <depend>rtcm_msgs</depend>
-
+  <depend>rclcpp_components</depend>
   
   <exec_depend>ros2launch</exec_depend>
 

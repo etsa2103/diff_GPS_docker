@@ -35,25 +35,38 @@ static bool parse_double(const std::string &s, double &out)
     catch (...) { return false; }
 }
 
-/* ------------------ Node ------------------ */
+/* ================== Composable Node ================== */
+namespace diff_gps
+{
+
 class DiffGpsNode : public rclcpp::Node
 {
 public:
-    DiffGpsNode() : Node("diff_gps_node")
+    explicit DiffGpsNode(const rclcpp::NodeOptions & options)
+    : Node("diff_gps_node", options)
     {
-        port_ = declare_parameter<std::string>("port", "/dev/ttyACM0");
+        port_ = declare_parameter<std::string>("port", "/dev/serial/by-id/usb-1a86_USB_Dual_Serial_5932003091-if00");
         baud_ = declare_parameter<int>("baudrate", 460800);
 
-        fix_pub_        = create_publisher<sensor_msgs::msg::NavSatFix>("gps/fix", 10);
-        heading_pub_    = create_publisher<geometry_msgs::msg::QuaternionStamped>("gps/heading", 10);
-        cov_pub_        = create_publisher<geometry_msgs::msg::Vector3>("gps/stddev", 10);
-        heading_acc_pub_= create_publisher<std_msgs::msg::Float64>("gps/heading_accuracy_deg", 10);
+        fix_pub_         = create_publisher<sensor_msgs::msg::NavSatFix>("gps/fix", 10);
+        heading_pub_     = create_publisher<geometry_msgs::msg::QuaternionStamped>("gps/heading", 10);
+        cov_pub_         = create_publisher<geometry_msgs::msg::Vector3>("gps/stddev", 10);
+        heading_acc_pub_ = create_publisher<std_msgs::msg::Float64>("gps/heading_accuracy_deg", 10);
 
         rtcm_sub_ = create_subscription<rtcm_msgs::msg::Message>(
             "/rtcm", 10,
             std::bind(&DiffGpsNode::rtcm_callback, this, std::placeholders::_1));
 
-        open_serial();
+        if (!serial_.IsOpen()) {
+            try {
+                open_serial();
+            } catch (const std::exception &e) {
+                RCLCPP_WARN_THROTTLE(
+                    get_logger(), *get_clock(), 5000,
+                    "Serial not available yet: %s", e.what());
+                return;
+            }
+        }
         timer_ = create_wall_timer(50ms, std::bind(&DiffGpsNode::read_serial, this));
     }
 
@@ -63,7 +76,6 @@ private:
     {
         serial_.Open(port_);
 
-        // Map common baudrates
         if (baud_ == 115200) serial_.SetBaudRate(LibSerial::BaudRate::BAUD_115200);
         else if (baud_ == 230400) serial_.SetBaudRate(LibSerial::BaudRate::BAUD_230400);
         else serial_.SetBaudRate(LibSerial::BaudRate::BAUD_460800);
@@ -90,7 +102,7 @@ private:
         else if (line.rfind("$PQTMTAR",0)==0) parse_pqtmtar(line);
     }
 
-    /* ------------------ GGA: Position ------------------ */
+    /* ------------------ GGA ------------------ */
     void parse_gga(const std::string &nmea)
     {
         auto f = split(nmea, ',');
@@ -129,7 +141,6 @@ private:
 
         fix_pub_->publish(msg);
 
-        // -------- Clean Status Print --------
         RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 2000,
             "POS %.7f %.7f alt=%.2f | StdDev[m]: %.3f %.3f %.3f | "
             "Heading=%.2f deg | HeadAcc=%.3f deg | Baseline=%.3f m",
@@ -138,7 +149,7 @@ private:
             last_heading_, last_heading_acc_deg_, last_baseline_m_);
     }
 
-    /* ------------------ GST: Accuracy ------------------ */
+    /* ------------------ GST ------------------ */
     void parse_gst(const std::string &nmea)
     {
         auto f = split(nmea, ',');
@@ -155,7 +166,7 @@ private:
         cov_pub_->publish(msg);
     }
 
-    /* ------------------ PQTMTAR: Dual Antenna Heading ------------------ */
+    /* ------------------ PQTMTAR ------------------ */
     void parse_pqtmtar(const std::string &nmea)
     {
         auto f = split(nmea, ',');
@@ -165,12 +176,10 @@ private:
         parse_double(f[8],  last_heading_);
         parse_double(f[11], last_heading_acc_deg_);
 
-        // Publish heading accuracy
         std_msgs::msg::Float64 acc;
         acc.data = last_heading_acc_deg_;
         heading_acc_pub_->publish(acc);
 
-        // Convert GNSS heading (0°=North CW) → ROS ENU yaw
         double yaw = (90.0 - last_heading_) * M_PI / 180.0;
 
         geometry_msgs::msg::QuaternionStamped q;
@@ -181,7 +190,6 @@ private:
         heading_pub_->publish(q);
     }
 
-    /* ------------------ NMEA Conversion ------------------ */
     static double nmea_to_deg(const std::string &val, const std::string &dir)
     {
         if (val.size() < 6) return 0.0;
@@ -193,7 +201,6 @@ private:
         return out;
     }
 
-    /* ------------------ RTCM Forwarding ------------------ */
     void rtcm_callback(const rtcm_msgs::msg::Message::SharedPtr msg)
     {
         if (!serial_.IsOpen() || msg->message.empty()) return;
@@ -203,7 +210,6 @@ private:
         } catch (...) {}
     }
 
-    /* ------------------ Members ------------------ */
     std::string port_;
     int baud_;
     LibSerial::SerialPort serial_;
@@ -221,11 +227,7 @@ private:
     double last_baseline_m_ = -1.0;
 };
 
-/* ------------------ Main ------------------ */
-int main(int argc,char** argv)
-{
-    rclcpp::init(argc,argv);
-    rclcpp::spin(std::make_shared<DiffGpsNode>());
-    rclcpp::shutdown();
-    return 0;
-}
+} // namespace diff_gps
+
+#include <rclcpp_components/register_node_macro.hpp>
+RCLCPP_COMPONENTS_REGISTER_NODE(diff_gps::DiffGpsNode)
