@@ -1,14 +1,14 @@
 #include <rclcpp/rclcpp.hpp>
 
-// Standard ROS messages for GPS
+// ROS messages
 #include <sensor_msgs/msg/nav_sat_fix.hpp>
 #include <sensor_msgs/msg/nav_sat_status.hpp>
 #include <geometry_msgs/msg/quaternion_stamped.hpp>
-
-// RTCM message type for RTK corrections
+#include <geometry_msgs/msg/vector3.hpp>
+#include <std_msgs/msg/float64.hpp>
 #include <rtcm_msgs/msg/message.hpp>
 
-// Serial communication library
+// Serial
 #include <libserial/SerialPort.h>
 
 #include <string>
@@ -19,236 +19,213 @@
 
 using namespace std::chrono_literals;
 
-/* ------------------ Utility Function ------------------ */
-/**
- * @brief Split a string by a given delimiter
- * @param s Input string
- * @param delim Delimiter character
- * @return Vector of split strings
- */
+/* ------------------ Utilities ------------------ */
 static std::vector<std::string> split(const std::string &s, char delim)
 {
     std::vector<std::string> out;
     std::stringstream ss(s);
     std::string item;
-    while (std::getline(ss, item, delim)) {
-        out.push_back(item);
-    }
+    while (std::getline(ss, item, delim)) out.push_back(item);
     return out;
 }
 
-/* ------------------ DiffGpsNode Class ------------------ */
+static bool parse_double(const std::string &s, double &out)
+{
+    try { if (s.empty()) return false; out = std::stod(s); return true; }
+    catch (...) { return false; }
+}
+
+/* ------------------ Node ------------------ */
 class DiffGpsNode : public rclcpp::Node
 {
 public:
     DiffGpsNode() : Node("diff_gps_node")
     {
-        // ------------------ Parameters ------------------
         port_ = declare_parameter<std::string>("port", "/dev/ttyACM0");
         baud_ = declare_parameter<int>("baudrate", 460800);
 
-        RCLCPP_INFO(get_logger(), "DiffGpsNode starting with port=%s baud=%d",
-                    port_.c_str(), baud_);
+        fix_pub_        = create_publisher<sensor_msgs::msg::NavSatFix>("gps/fix", 10);
+        heading_pub_    = create_publisher<geometry_msgs::msg::QuaternionStamped>("gps/heading", 10);
+        cov_pub_        = create_publisher<geometry_msgs::msg::Vector3>("gps/stddev", 10);
+        heading_acc_pub_= create_publisher<std_msgs::msg::Float64>("gps/heading_accuracy_deg", 10);
 
-        // ------------------ Publishers ------------------
-        fix_pub_ =
-            create_publisher<sensor_msgs::msg::NavSatFix>("gps/fix", 10);
-        heading_pub_ =
-            create_publisher<geometry_msgs::msg::QuaternionStamped>("gps/heading", 10);
-
-        // ------------------ Subscriber for RTCM Corrections ------------------
         rtcm_sub_ = create_subscription<rtcm_msgs::msg::Message>(
-            "/rtcm",
-            rclcpp::QoS(10),
-            std::bind(&DiffGpsNode::rtcm_callback, this, std::placeholders::_1)
-        );
-        RCLCPP_INFO(get_logger(), "Subscribed to /rtcm corrections");
+            "/rtcm", 10,
+            std::bind(&DiffGpsNode::rtcm_callback, this, std::placeholders::_1));
 
-        // ------------------ Serial Port Initialization ------------------
-        try {
-            open_serial();
-        } catch (const std::exception &e) {
-            RCLCPP_FATAL(get_logger(), "Failed to open serial port: %s", e.what());
-            throw;
-        }
-
-        // ------------------ Timer for Reading Serial ------------------
-        timer_ = create_wall_timer(
-            100ms, std::bind(&DiffGpsNode::read_serial, this));
+        open_serial();
+        timer_ = create_wall_timer(50ms, std::bind(&DiffGpsNode::read_serial, this));
     }
 
 private:
-    /* ------------------ Serial Port Setup ------------------ */
+    /* ------------------ Serial Setup ------------------ */
     void open_serial()
     {
-        RCLCPP_INFO(get_logger(), "Attempting to open serial port %s", port_.c_str());
-
         serial_.Open(port_);
-        serial_.SetBaudRate(LibSerial::BaudRate::BAUD_460800);
+
+        // Map common baudrates
+        if (baud_ == 115200) serial_.SetBaudRate(LibSerial::BaudRate::BAUD_115200);
+        else if (baud_ == 230400) serial_.SetBaudRate(LibSerial::BaudRate::BAUD_230400);
+        else serial_.SetBaudRate(LibSerial::BaudRate::BAUD_460800);
+
         serial_.SetCharacterSize(LibSerial::CharacterSize::CHAR_SIZE_8);
         serial_.SetParity(LibSerial::Parity::PARITY_NONE);
         serial_.SetStopBits(LibSerial::StopBits::STOP_BITS_1);
         serial_.SetFlowControl(LibSerial::FlowControl::FLOW_CONTROL_NONE);
-
-        RCLCPP_INFO(get_logger(), "Serial port opened successfully");
     }
 
-    /* ------------------ Read NMEA Lines from GPS ------------------ */
+    /* ------------------ Serial Read ------------------ */
     void read_serial()
     {
-        if (!serial_.IsOpen()) {
-            RCLCPP_WARN_THROTTLE(get_logger(), *this->get_clock(), 5000,
-                                 "Serial port not open yet");
-            return;
-        }
+        if (!serial_.IsOpen()) return;
 
         std::string line;
-        try {
-            serial_.ReadLine(line, '\n', 1000); // Timeout = 1 sec
-            RCLCPP_DEBUG(get_logger(), "Read line: %s", line.c_str());
-        } catch (const LibSerial::ReadTimeout &) {
-            RCLCPP_DEBUG(get_logger(), "Read timeout, no data available");
-            return;
-        } catch (const std::exception &e) {
-            RCLCPP_ERROR(get_logger(), "Exception reading serial: %s", e.what());
-            return;
-        }
+        try { serial_.ReadLine(line, '\n', 1000); }
+        catch (...) { return; }
 
-        if (line.empty()) return;
+        if (line.empty() || line[0] != '$') return;
 
-        // Only parse NMEA sentences starting with $
-        if (line[0] != '$') {
-            RCLCPP_DEBUG(get_logger(), "Ignoring line: %s", line.c_str());
-            return;
-        }
-
-        // Route different NMEA types
-        if (line.rfind("$GNGGA", 0) == 0) {
-            RCLCPP_DEBUG(get_logger(), "Parsing GGA: %s", line.c_str());
-            parse_gga(line);
-        } else if (line.rfind("$HDT", 0) == 0 ||
-                   line.rfind("$GNVTG", 0) == 0) {
-            RCLCPP_DEBUG(get_logger(), "Parsing heading: %s", line.c_str());
-            parse_heading(line);
-        } else {
-            RCLCPP_DEBUG(get_logger(), "Unknown NMEA type: %s", line.c_str());
-        }
+        if (line.rfind("$GNGGA",0)==0 || line.rfind("$GPGGA",0)==0) parse_gga(line);
+        else if (line.rfind("$GNGST",0)==0 || line.rfind("$GPGST",0)==0) parse_gst(line);
+        else if (line.rfind("$PQTMTAR",0)==0) parse_pqtmtar(line);
     }
 
-    /* ------------------ Parse GGA NMEA Sentence ------------------ */
+    /* ------------------ GGA: Position ------------------ */
     void parse_gga(const std::string &nmea)
     {
         auto f = split(nmea, ',');
-        if (f.size() < 10 || f[2].empty()) {
-            RCLCPP_WARN(get_logger(), "Invalid GGA line: %s", nmea.c_str());
-            return;
-        }
+        if (f.size() < 10 || f[2].empty()) return;
 
         double lat = nmea_to_deg(f[2], f[3]);
         double lon = nmea_to_deg(f[4], f[5]);
-        double alt = std::stod(f[9]);
+        double alt = 0.0;
+        int fix_quality = 0;
+
+        parse_double(f[9], alt);
+        try { if(!f[6].empty()) fix_quality = std::stoi(f[6]); }
+        catch (...) { fix_quality = 0; }
 
         sensor_msgs::msg::NavSatFix msg;
         msg.header.stamp = now();
         msg.header.frame_id = "gps";
-
         msg.latitude = lat;
         msg.longitude = lon;
         msg.altitude = alt;
 
-        msg.status.status = sensor_msgs::msg::NavSatStatus::STATUS_FIX;
-        msg.status.service = sensor_msgs::msg::NavSatStatus::SERVICE_GPS;
+        msg.status.status = (fix_quality > 0) ?
+            sensor_msgs::msg::NavSatStatus::STATUS_FIX :
+            sensor_msgs::msg::NavSatStatus::STATUS_NO_FIX;
 
-        fix_pub_->publish(msg);
-        RCLCPP_INFO_THROTTLE(get_logger(), *this->get_clock(), 2000,
-                              "Published GGA: lat=%.6f lon=%.6f alt=%.2f", lat, lon, alt);
-    }
-
-    /* ------------------ Parse Heading NMEA Sentence ------------------ */
-    void parse_heading(const std::string &nmea)
-    {
-        auto f = split(nmea, ',');
-        if (f.size() < 2 || f[1].empty()) {
-            RCLCPP_WARN(get_logger(), "Invalid heading line: %s", nmea.c_str());
-            return;
+        if (last_stddev_[0] >= 0.0) {
+            msg.position_covariance[0] = last_stddev_[0]*last_stddev_[0];
+            msg.position_covariance[4] = last_stddev_[1]*last_stddev_[1];
+            msg.position_covariance[8] = last_stddev_[2]*last_stddev_[2];
+            msg.position_covariance_type =
+                sensor_msgs::msg::NavSatFix::COVARIANCE_TYPE_DIAGONAL_KNOWN;
+        } else {
+            msg.position_covariance_type =
+                sensor_msgs::msg::NavSatFix::COVARIANCE_TYPE_UNKNOWN;
         }
 
-        double heading_deg = std::stod(f[1]);
-        double yaw = heading_deg * M_PI / 180.0;
+        fix_pub_->publish(msg);
+
+        // -------- Clean Status Print --------
+        RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 2000,
+            "POS %.7f %.7f alt=%.2f | StdDev[m]: %.3f %.3f %.3f | "
+            "Heading=%.2f deg | HeadAcc=%.3f deg | Baseline=%.3f m",
+            lat, lon, alt,
+            last_stddev_[0], last_stddev_[1], last_stddev_[2],
+            last_heading_, last_heading_acc_deg_, last_baseline_m_);
+    }
+
+    /* ------------------ GST: Accuracy ------------------ */
+    void parse_gst(const std::string &nmea)
+    {
+        auto f = split(nmea, ',');
+        if (f.size() < 9) return;
+
+        if (!parse_double(f[6], last_stddev_[0])) return;
+        if (!parse_double(f[7], last_stddev_[1])) return;
+        if (!parse_double(f[8], last_stddev_[2])) return;
+
+        geometry_msgs::msg::Vector3 msg;
+        msg.x = last_stddev_[0];
+        msg.y = last_stddev_[1];
+        msg.z = last_stddev_[2];
+        cov_pub_->publish(msg);
+    }
+
+    /* ------------------ PQTMTAR: Dual Antenna Heading ------------------ */
+    void parse_pqtmtar(const std::string &nmea)
+    {
+        auto f = split(nmea, ',');
+        if (f.size() < 11) return;
+
+        parse_double(f[5],  last_baseline_m_);
+        parse_double(f[8],  last_heading_);
+        parse_double(f[11], last_heading_acc_deg_);
+
+        // Publish heading accuracy
+        std_msgs::msg::Float64 acc;
+        acc.data = last_heading_acc_deg_;
+        heading_acc_pub_->publish(acc);
+
+        // Convert GNSS heading (0°=North CW) → ROS ENU yaw
+        double yaw = (90.0 - last_heading_) * M_PI / 180.0;
 
         geometry_msgs::msg::QuaternionStamped q;
         q.header.stamp = now();
         q.header.frame_id = "gps";
-
-        q.quaternion.x = 0.0;
-        q.quaternion.y = 0.0;
-        q.quaternion.z = std::sin(yaw * 0.5);
-        q.quaternion.w = std::cos(yaw * 0.5);
-
+        q.quaternion.z = std::sin(yaw*0.5);
+        q.quaternion.w = std::cos(yaw*0.5);
         heading_pub_->publish(q);
-        RCLCPP_INFO_THROTTLE(get_logger(), *this->get_clock(), 2000,
-                              "Published heading: %.2f deg", heading_deg);
     }
 
-    /* ------------------ Convert NMEA Lat/Lon to Decimal Degrees ------------------ */
+    /* ------------------ NMEA Conversion ------------------ */
     static double nmea_to_deg(const std::string &val, const std::string &dir)
     {
         if (val.size() < 6) return 0.0;
-
-        int deg_len = (dir == "N" || dir == "S") ? 2 : 3;
-        double deg = std::stod(val.substr(0, deg_len));
+        int deg_len = (dir=="N"||dir=="S") ? 2 : 3;
+        double deg = std::stod(val.substr(0,deg_len));
         double min = std::stod(val.substr(deg_len));
-
-        double out = deg + (min / 60.0);
-        if (dir == "S" || dir == "W") out *= -1.0;
+        double out = deg + min/60.0;
+        if (dir=="S"||dir=="W") out *= -1.0;
         return out;
     }
 
-    /* ------------------ RTCM Subscriber Callback ------------------ */
+    /* ------------------ RTCM Forwarding ------------------ */
     void rtcm_callback(const rtcm_msgs::msg::Message::SharedPtr msg)
     {
-        if (!serial_.IsOpen()) {
-            RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
-                                 "Serial port not open, cannot forward RTCM");
-            return;
-        }
-
-        if (msg->message.empty()) {
-            return;
-        }
-
+        if (!serial_.IsOpen() || msg->message.empty()) return;
         try {
-            // Forward the raw RTCM bytes to the GPS
-            LibSerial::DataBuffer buffer(msg->message.begin(), msg->message.end());
-            serial_.Write(buffer);
-
-            RCLCPP_DEBUG(get_logger(),
-                         "Forwarded RTCM (%zu bytes) to GPS",
-                         msg->message.size());
-        } catch (const std::exception &e) {
-            RCLCPP_ERROR(get_logger(), "RTCM write failed: %s", e.what());
-        }
+            LibSerial::DataBuffer buf(msg->message.begin(), msg->message.end());
+            serial_.Write(buf);
+        } catch (...) {}
     }
 
-    /* ------------------ Member Variables ------------------ */
+    /* ------------------ Members ------------------ */
     std::string port_;
     int baud_;
     LibSerial::SerialPort serial_;
     rclcpp::TimerBase::SharedPtr timer_;
+
     rclcpp::Publisher<sensor_msgs::msg::NavSatFix>::SharedPtr fix_pub_;
     rclcpp::Publisher<geometry_msgs::msg::QuaternionStamped>::SharedPtr heading_pub_;
+    rclcpp::Publisher<geometry_msgs::msg::Vector3>::SharedPtr cov_pub_;
+    rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr heading_acc_pub_;
     rclcpp::Subscription<rtcm_msgs::msg::Message>::SharedPtr rtcm_sub_;
+
+    double last_stddev_[3] = {-1.0,-1.0,-1.0};
+    double last_heading_ = -1.0;
+    double last_heading_acc_deg_ = -1.0;
+    double last_baseline_m_ = -1.0;
 };
 
-/* ------------------ Main Function ------------------ */
-int main(int argc, char **argv)
+/* ------------------ Main ------------------ */
+int main(int argc,char** argv)
 {
-    rclcpp::init(argc, argv);
-
-    auto node = std::make_shared<DiffGpsNode>();
-    RCLCPP_INFO(node->get_logger(), "DiffGpsNode spinning...");
-
-    rclcpp::spin(node);
+    rclcpp::init(argc,argv);
+    rclcpp::spin(std::make_shared<DiffGpsNode>());
     rclcpp::shutdown();
     return 0;
 }

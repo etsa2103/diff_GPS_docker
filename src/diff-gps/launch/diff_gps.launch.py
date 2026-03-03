@@ -36,33 +36,33 @@ def generate_launch_description():
     )
 
     # rtk_correction receiver node
-    rtk_receiver_node = Node(
-        package='rtk_correction',
-        executable='receiver',
-        name='rtk_receiver_node',
-        output='screen',
-        parameters=[{
-            'ip': LaunchConfiguration('ip'),
-            'port': LaunchConfiguration('port')
-        }]
-    )
+    # rtk_receiver_node = Node(
+    #     package='rtk_correction',
+    #     executable='receiver',
+    #     name='rtk_receiver_node',
+    #     output='screen',
+    #     parameters=[{
+    #         'ip': LaunchConfiguration('ip'),
+    #         'port': LaunchConfiguration('port')
+    #     }]
+    # )
     
-    rtk_broadcaster_node = Node(
-        package='rtk_correction',
-        executable='broadcaster',
-        name='rtk_broadcaster_node',
-        output='screen',
-        parameters=[{
-            'ip': LaunchConfiguration('ip'),
-            'port': LaunchConfiguration('port')
-        }]
-    )
+    # rtk_broadcaster_node = Node(
+    #     package='rtk_correction',
+    #     executable='broadcaster',
+    #     name='rtk_broadcaster_node',
+    #     output='screen',
+    #     parameters=[{
+    #         'ip': LaunchConfiguration('ip'),
+    #         'port': LaunchConfiguration('port')
+    #     }]
+    # )
 
     return LaunchDescription([
         test_arg,
         ip_arg,
         port_arg,
         gps_node,
-        rtk_receiver_node,
-        rtk_broadcaster_node
+        # rtk_receiver_node,
+        # rtk_broadcaster_node
     ])
