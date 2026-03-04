@@ -1,6 +1,9 @@
 
 
 #include "ros/dgps_node.hpp"
+#include <numbers>
+double pi = std::numbers::pi;
+
 
 using namespace dgps;
 
@@ -82,5 +85,68 @@ void DGPSNode::publishHeading(dgps::Orientation attitude)
 
 void DGPSNode::publishDiffGPS(dgps::DiffNavSatFix dgps)
 {
+    // Separate position and heading data
+    dgps::GlobalCoord nmea = dgps.gps;
+    dgps::Orientation attitude = dgps.orientation;
+
+    // Publish right antenna fix and heading
+    publishGPS(nmea);
+    publishHeading(attitude);
+
+    // Compute left antenna position
+    double heading  = attitude.pry.z * pi / 180.0; // radians
+    double baseline = dgps.baseline;                 // meters
+
+    double dx = -baseline * sin(heading);  // East offset (meters)
+    double dy =  baseline * cos(heading);  // North offset (meters)
+
+    // Convert meter offsets to lat/lon
+    constexpr double R = 6378137.0; // WGS84 Earth radius (meters)
+    double dLat = dy / R; // Latitude offset (radians)
+
+    double lat_rad = nmea.latitude * pi / 180.0; // Latitude in radians (used for longitude scaling)
+    double dLon = dx / (R * cos(lat_rad)); // Longitude offset (radians)
+
+    double left_lat = nmea.latitude  + dLat * 180.0 / pi;
+    double left_lon = nmea.longitude + dLon * 180.0 / pi;
+    double left_alt = nmea.altitude;
     
+    // Create and publish left fix message
+    sensor_msgs::msg::NavSatFix left_msg;
+    left_msg.header.stamp = now();
+    left_msg.header.frame_id = "enu";
+
+    left_msg.latitude  = left_lat;
+    left_msg.longitude = left_lon;
+    left_msg.altitude  = left_alt;
+
+    left_msg.position_covariance.fill(0.0);
+    left_msg.position_covariance[0] = nmea.covariance.x;
+    left_msg.position_covariance[4] = nmea.covariance.y;
+    left_msg.position_covariance[8] = nmea.covariance.z;
+
+    left_msg.status.status =
+        (nmea.status > 0) ?
+        sensor_msgs::msg::NavSatStatus::STATUS_FIX :
+        sensor_msgs::msg::NavSatStatus::STATUS_NO_FIX;
+
+    left_msg.position_covariance_type =
+        sensor_msgs::msg::NavSatFix::COVARIANCE_TYPE_DIAGONAL_KNOWN;
+
+    left_fix_pub_->publish(left_msg);
+
+    // Create and publish average fix message
+    sensor_msgs::msg::NavSatFix avg_msg;
+    avg_msg.header = left_msg.header;
+
+    avg_msg.latitude  = (left_lat  + nmea.latitude)  * 0.5;
+    avg_msg.longitude = (left_lon  + nmea.longitude) * 0.5;
+    avg_msg.altitude  = (left_alt  + nmea.altitude)  * 0.5;
+
+    avg_msg.position_covariance = left_msg.position_covariance;
+    avg_msg.status = left_msg.status;
+    avg_msg.position_covariance_type =
+        sensor_msgs::msg::NavSatFix::COVARIANCE_TYPE_DIAGONAL_KNOWN;
+
+    avg_fix_pub_->publish(avg_msg);
 }
