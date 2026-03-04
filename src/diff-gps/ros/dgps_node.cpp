@@ -40,6 +40,15 @@ void DGPSNode::publishGPS(dgps::NavSatFix nmea)
     msg.longitude = nmea.gps.longitude;
     msg.altitude = nmea.gps.altitude;
 
+    msg.position_covariance[0] = nmea.variance.x;
+    msg.position_covariance[4] = nmea.variance.y;
+    msg.position_covariance[8] = nmea.variance.z;
+
+    msg.status.status = (nmea.status > 0) ?
+            sensor_msgs::msg::NavSatStatus::STATUS_FIX :
+            sensor_msgs::msg::NavSatStatus::STATUS_NO_FIX;
+    msg.position_covariance_type=sensor_msgs::msg::NavSatFix::COVARIANCE_TYPE_DIAGONAL_KNOWN;
+
     fix_pub_->publish(msg);
 }
 
